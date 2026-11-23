@@ -16,9 +16,12 @@
 #include "presetui.h"
 #include <map>
 #include <mutex>
+#include <cstring>
+#include <cwchar>
 #include <windows.h>
 #include <winioctl.h>
 #include <objbase.h>
+#include <shlobj.h>
 
 using IntP = intptr_t;
 
@@ -42,7 +45,10 @@ enum {
 };
 enum { FPE_Tempo = 0 };   // PV_ProcessEvent: float BPM bits in Value, samples per tick in Flags
 enum { PV_DestroyObject = 0, PV_Dispatcher, PV_Idle, PV_SaveRestore, PV_GetName,
-       PV_ProcessEvent, PV_ProcessParam, PV_EffRender };
+       PV_ProcessEvent, PV_ProcessParam, PV_EffRender, PV_GenRender,
+       PV_TriggerVoice, PV_VoiceRelease, PV_VoiceKill, PV_VoiceProcessEvent,
+       PV_VoiceRender, PV_NewTick, PV_MIDITick, PV_MIDIIn, PV_MsgIn };
+enum { FPF_Generator = 1, FPF_GetNoteInput = 1 << 4 };
 enum { REC_UpdateValue = 1, REC_GetValue = 2 };
 enum {
     FHD_SetLatency = 30, FHD_GetNumInOut = 50, FHD_GetInstance = 24,
@@ -145,6 +151,7 @@ struct FruityHost {
     // ---- private tail (not part of TFruityPlugHost) ----
     Node* Owner;
     const char* ProgPath;
+    const char* ProjData;
     IntP Latency;
     HWND EditorHwnd;
     struct FruityTiming* Timing;
@@ -169,7 +176,7 @@ static void* serviceObj = serviceVt;
 static void* resourceVt[96];
 static void* resourceObj = resourceVt;
 
-// ---- FHD_71: plugin-manager service ---------------------------------------
+// ---- FHD_71: plugin-manager/path-manager service ----------------------------
 // Patcher is a recursive host: after it LoadLibrarys a sub-plugin module it
 // asks this service to instantiate it. Real FL contract (from FLEngine):
 //   vt[0](code,flagByte,out0x400)  record query -> -1 found / 0 not
@@ -178,34 +185,60 @@ static void* resourceObj = resourceVt;
 //   vt[6](0x40F, inModulePtr, mask, d, out0x400) instantiate -> -1
 // The out record is the created plugin object's first 0x400 bytes (a Delphi
 // object snapshot — its vtable keeps pointing at the plugin's real methods).
-struct FruityMgrSvc { void** vt; FruityHost* host; };
+// Plug-ins can skip the wrapper's methods entirely and call
+// [svc+8]->vt[0](inner, code, flagByte, out0x400) on the inner manager
+// object directly — FLEX resolves its packs root this way (code 0x415 ->
+// user data path as UTF-16 text in out). Nonzero return = string found.
+struct FruityMgrInner { void** vt; FruityHost* host; };
+static void* mgrInnerVt[96];
+static FruityHost* gAnyHost;
+static wchar_t gFlRootW[MAX_PATH];
+static wchar_t gFlInstallSharedW[MAX_PATH];
+static IntP __stdcall SvcPathQuery(IntP code, IntP flag, IntP out);
+IntP __stdcall MgrInnerQuery(FruityMgrInner* self, IntP code, IntP flag, IntP out) {
+    return SvcPathQuery(code, flag, out);
+}
+struct FruityMgrSvc { void** vt; FruityMgrInner* inner; };
 static void* mgrSvcVt[96];
-IntP __stdcall MgrQueryRecord(void*, IntP, IntP, IntP) { return 0; }
-IntP __stdcall MgrOp(void*, IntP a, IntP, IntP, IntP, IntP) {
+// Every service object is {vt, FruityMgrInner*, tag}: plug-ins may skip the
+// wrapper and call inner->vt[0] directly (FLEX's pack-dir query), so the
+// inner always carries the path-query contract. tag is the FHD id / op code
+// that produced the object, for log attribution.
+static void** NewSvcObj(void** vt, IntP tag) {
+    return new void* [3] { vt, new FruityMgrInner { mgrInnerVt, gAnyHost }, (void*)tag };
+}
+IntP __stdcall MgrQueryRecord(void*, IntP a, IntP b, IntP out) {
+    FruityDbg("  svc71: m0 record code=%llx flag=%llx out=%p\n", (long long)a, (long long)b, (void*)out);
+    return 0;
+}
+IntP __stdcall MgrOp(void*, IntP a, IntP b, IntP c, IntP d, IntP e) {
+    FruityDbg("  svc71: m2 op=%llx b=%llx c=%llx d=%llx e=%llx\n", (long long)a, (long long)b, (long long)c, (long long)d, (long long)e);
     // Unknown manager ops get a generic object like other service calls —
     // callers Supports()/method-call into results, a bare 0 poisons them.
-    return (IntP)new void* [2] { serviceVt, (void*)a };
+    return (IntP)NewSvcObj(serviceVt, a);
 }
-IntP __stdcall MgrIfQuery(void* self, IntP a, IntP, IntP, IntP, IntP) {
+IntP __stdcall MgrIfQuery(void* self, IntP a, IntP b, IntP c, IntP d, IntP e) {
+    FruityDbg("  svc71: m3 ifq op=%llx b=%llx c=%llx d=%llx\n", (long long)a, (long long)b, (long long)c, (long long)d);
     // Interface query by op-code (0x3F4/0x3FE ...): hand back a generic
     // service object like unknown services get.
-    return (IntP)new void* [2] { serviceVt, (void*)a };
+    return (IntP)NewSvcObj(serviceVt, a);
 }
 IntP __stdcall MgrCreate(FruityMgrSvc* self, IntP code, IntP inModulePtr,
                          IntP /*mask*/, IntP /*aux*/, IntP outRec) {
-    if (code != 0x40F || !inModulePtr || !outRec || !self->host || !self->host->IsPatcher)
-        return (IntP)new void* [2] { serviceVt, (void*)code };
+    if (code != 0x40F || !inModulePtr || !outRec || !self->inner || !self->inner->host ||
+        !self->inner->host->IsPatcher)
+        return (IntP)NewSvcObj(serviceVt, code);
     MEMORY_BASIC_INFORMATION mbi = {};
     if (!VirtualQuery((void*)inModulePtr, &mbi, sizeof mbi) || mbi.Type != MEM_IMAGE)
-        return (IntP)new void* [2] { serviceVt, (void*)code };
+        return (IntP)NewSvcObj(serviceVt, code);
     auto create = (void*(__stdcall*)(void*, IntP))GetProcAddress((HMODULE)mbi.AllocationBase, "CreatePlugInstance");
-    if (!create) return (IntP)new void* [2] { serviceVt, (void*)code };
+    if (!create) return (IntP)NewSvcObj(serviceVt, code);
     auto* host2 = new FruityHost;
-    BuildHostObject(*host2, self->host->ProgPath, self->host->Owner);
-    host2->EditorHwnd = self->host->EditorHwnd;
+    BuildHostObject(*host2, self->inner->host->ProgPath, self->inner->host->Owner);
+    host2->EditorHwnd = self->inner->host->EditorHwnd;
     void* plug = nullptr;
     __try { plug = create(host2, 0x7ea1); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    if (!plug) return (IntP)new void* [2] { serviceVt, (void*)code };
+    if (!plug) return (IntP)NewSvcObj(serviceVt, code);
     FruityDbg("  svc71: create module=%p plug=%p\n", mbi.AllocationBase, plug);
     __try { memcpy((void*)outRec, plug, 0x400); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
@@ -219,16 +252,16 @@ IntP __stdcall MgrCreate(FruityMgrSvc* self, IntP code, IntP inModulePtr,
 // service calls can be attributed.
 static IntP __stdcall ServiceStubImpl(int slot, void* self, IntP a, IntP b, IntP c) {
     IntP tag = 0;
-    if (gFruityDbgOn) __try { tag = ((IntP*)self)[1]; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (gFruityDbgOn) __try { tag = ((IntP*)self)[2]; } __except (EXCEPTION_EXECUTE_HANDLER) {}
     FruityDbg("  svc[fhd=%lld] m%d a=%p b=%p c=%p -> obj\n", (long long)tag, slot, (void*)a, (void*)b, (void*)c);
-    return (IntP)new void* [2] { serviceVt, (void*)tag };
+    return (IntP)NewSvcObj(serviceVt, tag);
 }
 template<int N> static IntP __stdcall ServiceStubN(void* self, IntP a, IntP b, IntP c) {
     return ServiceStubImpl(N, self, a, b, c);
 }
 IntP __stdcall ServiceStub(void*, IntP a, IntP, IntP) {
     FruityDbg("  svc: method a=%p -> obj\n", (void*)a);
-    return (IntP)new void* [2] { serviceVt, nullptr };
+    return (IntP)NewSvcObj(serviceVt, 0);
 }
 IntP __stdcall ServiceRef(void*, IntP, IntP, IntP) { return 1; }
 // vtable[0] of a service object is its query call (req -> out). Mirrors probe
@@ -238,7 +271,35 @@ IntP __stdcall ServiceRef(void*, IntP, IntP, IntP) { return 1; }
 //  * fhd=86 (SynthResModule resource registry: '.CAPTION', 'Menu', ...) answers
 //    plain "not found" without writing — out[0] is read as the caption string,
 //    so writing our pointer there rendered its bytes as text ("0C??").
-IntP __stdcall ServiceLookup(void* self, IntP req, IntP out, IntP) {
+// Small-integer req means the caller is doing the code/flag/out record query,
+// not passing a name pointer: FLEX resolves its packs root by calling the
+// service's vt[0] as vt[0](svc, code, flagByte, out0x400) — code 0x415 is the
+// user data root, answered as UTF-16 text. (FruityMgrInner.vt[0] same shape.)
+// flag selects the content-search root: 0 is the user data dir
+// (Documents\Image-Line), 1 is the factory content dir (<FL>\Data\Patches\
+// Packs — FLEX's *.flexpack files live there), 2 the wider <FL>\Data.
+static IntP __stdcall SvcPathQuery(IntP code, IntP flag, IntP out) {
+    FruityDbg("  svc: path query code=%llx flag=%llx out=%p\n", (long long)code,
+              (long long)flag, (void*)out);
+    if (!gAnyHost || !out) return 0;
+    char path[MAX_PATH] = {};
+    if (flag == 1 || flag == 2) {
+        const wchar_t* sub = flag == 1 ? L"\\Data\\Patches\\Packs\\" : L"\\Data\\";
+        wchar_t w[MAX_PATH];
+        swprintf_s(w, L"%s%s", gFlRootW[0] ? gFlRootW : gFlInstallSharedW, sub);
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, path, MAX_PATH, nullptr, nullptr);
+    } else {
+        const char* p = gAnyHost->ProjData ? gAnyHost->ProjData : gAnyHost->ProgPath;
+        strcpy_s(path, p);
+    }
+    // out is a UTF-8/ANSI buffer, not UTF-16: FLEX concatenates its bytes
+    // directly and a wide write leaves it reading only the first char.
+    __try { strcpy_s((char*)out, 0x400, path); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return 1;
+}
+IntP __stdcall ServiceLookup(void* self, IntP req, IntP out, IntP out2) {
+    if (req > 0 && req < 0x10000) return SvcPathQuery(req, out, out2);
     __try {
         char dump[33] = {};
         if (req) for (int j = 0; j < 32; ++j) { char c = ((const char*)req)[j]; dump[j] = (c >= 32 && c < 127) ? c : '.'; }
@@ -248,6 +309,7 @@ IntP __stdcall ServiceLookup(void* self, IntP req, IntP out, IntP) {
     return 0;
 }
 IntP __stdcall ResourceLookup(void* /*self*/, IntP req, IntP out, IntP size) {
+    if (req > 0 && req < 0x10000) return SvcPathQuery(req, out, size);
     // Resource registration records the answer text into a caller record and
     // caches it for later rendering (menus, dropdowns) — writing an object
     // pointer into out[0] here leaves mojibake in the editor. Echo the
@@ -302,8 +364,15 @@ IntP __stdcall HostDispatcher(FruityHost* self, IntP /*sender*/, IntP id, IntP i
         if (value) FillSongTime(self, index, (FPTime*)value); return 1;
     case FHD_GetSelTime:                                               // no selection
         if (value) { ((FPTime*)value)->t = 0; ((FPTime*)value)->t2 = 0; } return 0;
-    case FHD_GetProgPath: return (IntP)self->ProgPath;                 // PAnsiChar
-    case FHD_GetProjDataPath: return (IntP)self->ProgPath;
+    // FL 2025 GetPath: Index selects which path (0 = prog root; other GP_*
+    // indices are user-data paths — FLEX uses idx 7 for its packs dir).
+    case FHD_GetProgPath:
+        if (index == 0) return (IntP)self->ProgPath;
+        FruityDbg("getpath idx=%lld -> projdata\n", (long long)index);
+        return (IntP)(self->ProjData ? self->ProjData : self->ProgPath);
+    // FL's project data path is the user's Image-Line folder — FLEX packs,
+    // Newtone data, user presets all live under <Documents>\Image-Line.
+    case FHD_GetProjDataPath: return (IntP)(self->ProjData ? self->ProjData : self->ProgPath);
     case FHD_CheckProdCode: {
         // The plug-in marks its licence record pending (ORs 0x8000 into flags)
         // and asks the host to attest the product. FL clears the pending bit
@@ -317,20 +386,35 @@ IntP __stdcall HostDispatcher(FruityHost* self, IntP /*sender*/, IntP id, IntP i
     }
     case FHD_SetLatency: self->Latency = value; return 0;
     case 45: case 19: return 1;                                        // debug log / msg box: swallow
-    case 86: return (IntP)&resourceObj;                                // resource registry
-    case 71: return (IntP)new FruityMgrSvc { mgrSvcVt, self };         // plugin manager (Patcher)
+    case 86: return (IntP)NewSvcObj(resourceVt, 86);                                // resource registry
+    case 71: {
+        auto* inner = new FruityMgrInner { mgrInnerVt, self };
+        return (IntP)new FruityMgrSvc { mgrSvcVt, inner };             // plugin manager
+    }
     // Documented calls with plain-value answers must not fall through to the
     // service object: e.g. the parameter right-click menu asks for host entries
     // (18) until it gets null — a non-null answer looped forever and froze the UI.
     case 18: return 0;                                                 // GetParamMenuEntry: no host entries
     case 1:  return 0;                                                 // GetParamMenuFlags
     case 0:  return 1;                                                 // ParamMenu (host item chosen)
+    case 5: return 0;                                                // WantMIDIInput: accepted
+    case 92:
+        // Newer GetPath (FL 2025, beyond the SDK's documented ids): Value is
+        // an out char buffer the host fills with a path. Index 0 is the user
+        // data root — FLEX appends "FLEX\Packs" onto it; a non-string answer
+        // leaves it opening relative paths.
+        if (value) {
+            const char* p = self->ProjData ? self->ProjData : self->ProgPath;
+            FruityDbg("getpath92 idx=%lld -> %s\n", (long long)index, p);
+            __try { strcpy_s((char*)value, MAX_PATH, p); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        return 1;
     case 3: case 9: case 13: case 27: case 33: case 40: return 0;      // names changed, presets, idle, params, thread-safe, captionize
     }
     // Unknown services get a fresh object each (like the probe): plug-ins
     // track them by identity and a shared singleton confused Newtone.
     // obj[1] tags the dispatcher id so later method calls can be attributed.
-    return (IntP)new void* [2] { serviceVt, (void*)id };
+    return (IntP)NewSvcObj(serviceVt, id);
 }
 // True when this machine carries a real Image-Line registration
 // (HKCU\Software\Image-Line\Registrations\<product>). Result is cached: the
@@ -429,19 +513,31 @@ static BOOL WINAPI FruityPostMessageW(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 // Delphi's last-resort error path ("Runtime error 216 at ...") goes through
 // MessageBox — log the text so a fatal report is not lost headlessly.
+// Image-Line's optional shared-library probe ("Could not find oggio
+// DLL/dylib at ...") is modal and stalls plug-in loading; the plug-in falls
+// back to its built-in code when dismissed. Auto-accept it.
+static bool SuppressDllProbe(LPCWSTR text) {
+    return text && wcsstr(text, L"DLL/dylib");
+}
+static bool SuppressDllProbe(LPCSTR text) {
+    return text && strstr(text, "DLL/dylib");
+}
 static int(WINAPI* orig_MessageBoxW)(HWND, LPCWSTR, LPCWSTR, UINT);
 static int WINAPI FruityMessageBoxW(HWND h, LPCWSTR text, LPCWSTR caption, UINT type) {
     FruityDbg("msgbox: [%ls] %ls\n", caption ? caption : L"", text ? text : L"");
+    if (SuppressDllProbe(text)) { FruityDbg("msgbox: auto-accepted optional-library probe\n"); return IDOK; }
     return orig_MessageBoxW(h, text, caption, type);
 }
 static int(WINAPI* orig_MessageBoxA)(HWND, LPCSTR, LPCSTR, UINT);
 static int WINAPI FruityMessageBoxA(HWND h, LPCSTR text, LPCSTR caption, UINT type) {
     FruityDbg("msgbox: [%s] %s\n", caption ? caption : "", text ? text : "");
+    if (SuppressDllProbe(text)) { FruityDbg("msgbox: auto-accepted optional-library probe\n"); return IDOK; }
     return orig_MessageBoxA(h, text, caption, type);
 }
 static int(WINAPI* orig_MessageBoxExW)(HWND, LPCWSTR, LPCWSTR, UINT, WORD);
 static int WINAPI FruityMessageBoxExW(HWND h, LPCWSTR text, LPCWSTR caption, UINT type, WORD lang) {
     FruityDbg("msgbox: [%ls] %ls\n", caption ? caption : L"", text ? text : L"");
+    if (SuppressDllProbe(text)) { FruityDbg("msgbox: auto-accepted optional-library probe\n"); return IDOK; }
     return orig_MessageBoxExW(h, text, caption, type, lang);
 }
 // File/library access logging: editor-type plug-ins resolve companion
@@ -472,19 +568,59 @@ static DWORD WINAPI FruityExpandEnvironmentStringsW(LPCWSTR src, LPWSTR dst, DWO
     FruityDbg("expandenv '%ls' -> '%ls' (r=%lu)\n", src ? src : L"<null>", (r && dst) ? dst : L"?", (unsigned long)r);
     return r;
 }
+static void HookFruityModule(HMODULE mod);
+// A module a plug-in pulls in during construction (its *_Engine_x64.dll, IL
+// companion libs) needs the IAT shims before any of its code runs — e.g.
+// FLEX's Engine probes an optional oggio DLL and MessageBoxes the failure
+// during create. Image-Line-tree modules only, never system DLLs.
+static void HookNewIlModule(HMODULE r) {
+    if (!r) return;
+    wchar_t mp[MAX_PATH];
+    if (!GetModuleFileNameW(r, mp, MAX_PATH)) return;
+    if (!wcsstr(mp, L"\\Image-Line\\") && !wcsstr(mp, L"\\FruityMirror\\")) return;
+    __try { HookFruityModule(r); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
 static HMODULE(WINAPI* orig_LoadLibraryW)(LPCWSTR);
+static HMODULE(WINAPI* orig_LoadLibraryExW)(LPCWSTR, HANDLE, DWORD);
+static HMODULE IlSharedLoad(LPCWSTR path);
 static HMODULE WINAPI FruityLoadLibraryW(LPCWSTR path) {
     HMODULE r = orig_LoadLibraryW(path);
     FruityDbg("loadlib %ls -> %p (err %lu)\n", path ? path : L"<null>", r, GetLastError());
+    if (!r) r = IlSharedLoad(path);
+    HookNewIlModule(r);
     return r;
 }
-static HMODULE(WINAPI* orig_LoadLibraryExW)(LPCWSTR, HANDLE, DWORD);
+// Shared support DLLs (oggio_x64.dll, ...) live in "<FL root>\Shared" — FL's
+// dll dir, which plug-ins reach through search paths we don't replicate.
+// When a bare-name load fails, retry it against the real Shared folder.
+static HMODULE IlSharedLoad(LPCWSTR path) {
+    const wchar_t* base = gFlInstallSharedW;
+    if (!path || !base[0]) return nullptr;
+    if (wcschr(path, L'\\') && wcsstr(path, L"\\Shared\\")) return nullptr;
+    const wchar_t* name = wcsrchr(path, L'\\');
+    name = name ? name + 1 : path;
+    wchar_t full[MAX_PATH];
+    swprintf_s(full, L"%s\\%s", base, name);
+    return orig_LoadLibraryExW(full, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+}
 static HMODULE WINAPI FruityLoadLibraryExW(LPCWSTR path, HANDLE f, DWORD flags) {
     HMODULE r = orig_LoadLibraryExW(path, f, flags);
     FruityDbg("loadlibex %ls -> %p (err %lu)\n", path ? path : L"<null>", r, GetLastError());
+    if (!r) r = IlSharedLoad(path);
+    HookNewIlModule(r);
     return r;
 }
 // Registry probing is log-only: shows which licence keys a plug-in consults.
+static BOOL(WINAPI* orig_SetCurrentDirectoryW)(LPCWSTR);
+static BOOL WINAPI FruitySetCurrentDirectoryW(LPCWSTR path) {
+    FruityDbg("setcwd %ls\n", path ? path : L"<null>");
+    return orig_SetCurrentDirectoryW(path);
+}
+static BOOL(WINAPI* orig_SetCurrentDirectoryA)(LPCSTR);
+static BOOL WINAPI FruitySetCurrentDirectoryA(LPCSTR path) {
+    FruityDbg("setcwd %s\n", path ? path : "<null>");
+    return orig_SetCurrentDirectoryA(path);
+}
 static LSTATUS(WINAPI* orig_RegOpenKeyExW)(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY);
 static LSTATUS WINAPI FruityRegOpenKeyExW(HKEY key, LPCWSTR sub, DWORD opt, REGSAM sam, PHKEY out) {
     LSTATUS r = orig_RegOpenKeyExW(key, sub, opt, sam, out);
@@ -553,6 +689,10 @@ static void HookFruityModule(HMODULE mod) {
     PatchIatSlot(mod, "kernelbase.dll", "FindFirstFileW", (void*)FruityFindFirstFileW, (void**)&orig_FindFirstFileW);
     PatchIatSlot(mod, "kernel32.dll", "GetFileAttributesW", (void*)FruityGetFileAttributesW, (void**)&orig_GetFileAttributesW);
     PatchIatSlot(mod, "kernelbase.dll", "GetFileAttributesW", (void*)FruityGetFileAttributesW, (void**)&orig_GetFileAttributesW);
+    PatchIatSlot(mod, "kernel32.dll", "SetCurrentDirectoryW", (void*)FruitySetCurrentDirectoryW, (void**)&orig_SetCurrentDirectoryW);
+    PatchIatSlot(mod, "kernelbase.dll", "SetCurrentDirectoryW", (void*)FruitySetCurrentDirectoryW, (void**)&orig_SetCurrentDirectoryW);
+    PatchIatSlot(mod, "kernel32.dll", "SetCurrentDirectoryA", (void*)FruitySetCurrentDirectoryA, (void**)&orig_SetCurrentDirectoryA);
+    PatchIatSlot(mod, "kernelbase.dll", "SetCurrentDirectoryA", (void*)FruitySetCurrentDirectoryA, (void**)&orig_SetCurrentDirectoryA);
     PatchIatSlot(mod, "kernel32.dll", "ExpandEnvironmentStringsW", (void*)FruityExpandEnvironmentStringsW, (void**)&orig_ExpandEnvironmentStringsW);
     PatchIatSlot(mod, "kernelbase.dll", "ExpandEnvironmentStringsW", (void*)FruityExpandEnvironmentStringsW, (void**)&orig_ExpandEnvironmentStringsW);
     PatchIatSlot(mod, "kernel32.dll", "LoadLibraryW", (void*)FruityLoadLibraryW, (void**)&orig_LoadLibraryW);
@@ -835,6 +975,8 @@ void BuildHostObject(FruityHost& h, const char* progPath, Node* owner) {
         serviceVt[2] = (void*)ServiceRef;
         for (auto& f : resourceVt) f = (void*)ServiceStub;
         resourceVt[0] = (void*)ResourceLookup;
+        for (auto& f : mgrInnerVt) f = (void*)ServiceStub;
+        mgrInnerVt[0] = (void*)MgrInnerQuery;
         for (auto& f : mgrSvcVt) f = (void*)ServiceStub;
         mgrSvcVt[0] = (void*)ServiceLookup;
         mgrSvcVt[1] = (void*)ServiceRef;
@@ -868,6 +1010,7 @@ void BuildHostObject(FruityHost& h, const char* progPath, Node* owner) {
     for (int i = 0; i < 4; ++i) h.TempBuffers[i] = temp[i];
     h.Owner = owner;
     h.ProgPath = progPath;
+    gAnyHost = &h;
 }
 
 // SEH-guarded entry points into the plug-in DLL.
@@ -1000,6 +1143,48 @@ bool GuardedRender(void* plug, const float* in, float* out, int frames) {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+// Generators advance their voice engine on per-tick host calls, separate
+// from Gen_Render — voices that never see a tick stay silent.
+void GuardedNoArgCall(void* plug, int slot) {
+    __try {
+        auto fn = (void(__stdcall*)(void*))(*(void***)plug)[slot];
+        fn(plug);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+// Gen_Render(DestBuffer, var Length): generators may render fewer samples;
+// len returns the produced count.
+bool GuardedGenRender(void* plug, float* dest, int& len) {
+    __try {
+        auto fn = (void(__stdcall*)(void*, float*, int*))(*(void***)plug)[PV_GenRender];
+        fn(plug, dest, &len);
+        return len > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// MIDIIn(var Msg): packed TMIDIOutMsg {Status,Data1,Data2,Port} by reference —
+// the plug-in may rewrite it (MIDIMsg_Null to kill).
+void GuardedMIDIIn(void* plug, uint32_t msg) {
+    int m = (int)msg;
+    __try {
+        auto fn = (void(__stdcall*)(void*, int*))(*(void***)plug)[PV_MIDIIn];
+        fn(plug, &m);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+// Piano-roll notes reach generators through the voice API, not MIDIIn:
+// TriggerVoice(TVoiceParams*, SetTag) -> handle, Voice_Release/Kill(handle).
+struct VoiceLevels { float pan, vol, pitch, fcut, fres; };   // TLevelParams (new)
+struct VoiceParams { VoiceLevels init, fin; };               // TVoiceParams
+IntP GuardedTriggerVoice(void* plug, VoiceParams* vp, IntP tag, bool& ok) {
+    __try {
+        auto fn = (IntP(__stdcall*)(void*, VoiceParams*, IntP))(*(void***)plug)[PV_TriggerVoice];
+        return fn(plug, vp, tag);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; return 0; }
+}
+void GuardedVoiceCall(void* plug, int slot, IntP handle) {
+    __try {
+        auto fn = (void(__stdcall*)(void*, IntP))(*(void***)plug)[slot];
+        fn(plug, handle);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
 void GuardedSaveRestore(void* plug, IStream* stream, int save, bool& ok) {
     __try { GuardedPlugCall(plug, PV_SaveRestore, (IntP)stream, save, 0, ok); }
     __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
@@ -1020,7 +1205,7 @@ std::map<std::wstring, std::weak_ptr<FruityModule>>& ModuleCache() {
     return cache;
 }
 
-class FruityNode final : public Node {
+class FruityNode final : public Node, public FruityGen {
 public:
     explicit FruityNode(int id) : Node(id) {}
     ~FruityNode() override { CloseEditor(); Unload(); }
@@ -1048,6 +1233,10 @@ public:
     void Idle() override;
 
     bool Load(const std::wstring& path, std::wstring& error);
+    bool IsGenerator() const override { return isGenerator; }
+    void SendMIDI(uint32_t msg) override;
+    intptr_t NoteOn(int semitone, float velocity) override;
+    void NoteOff(intptr_t voice) override;
 
 private:
     void Unload();
@@ -1060,8 +1249,10 @@ private:
     FruityHost fhost{};
     std::wstring flRoot;                            // real FL install root (pre-mirror)
     char progPath[MAX_PATH] = {};
+    char projDataPath[MAX_PATH] = {};
     void* plug = nullptr;
     FruityInfo info{};
+    bool isGenerator = false;
     int numParams = 0;
     std::vector<uint8_t> paramIsFloat;          // PI_Float per param
     std::vector<std::string> paramNames;
@@ -1092,6 +1283,8 @@ bool FruityNode::Load(const std::wstring& path, std::wstring& error) {
         }
     }
     flRoot = FruityFlRoot(path);
+    wcscpy_s(gFlRootW, flRoot.c_str());
+    swprintf_s(gFlInstallSharedW, L"%s\\Shared", flRoot.c_str());
     std::wstring wprog = flRoot;
     if (!GetEnvironmentVariableW(L"MP_FRUITY_NOMIRROR", nullptr, 0))
         wprog = EnsureFlMirror(wprog, path);
@@ -1103,6 +1296,14 @@ bool FruityNode::Load(const std::wstring& path, std::wstring& error) {
     BuildHostObject(fhost, progPath, this);
     fhost.Timing = &timing;
     fhost.IsPatcher = path.find(L"Patcher") != std::wstring::npos;
+    PWSTR docs = nullptr;
+    if (SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs) == S_OK) {
+        std::wstring il = std::wstring(docs) + L"\\Image-Line\\";
+        CoTaskMemFree(docs);
+        if (GetFileAttributesW(il.c_str()) != INVALID_FILE_ATTRIBUTES)
+            WideCharToMultiByte(CP_UTF8, 0, il.c_str(), -1, projDataPath, MAX_PATH, nullptr, nullptr);
+    }
+    if (projDataPath[0]) fhost.ProjData = projDataPath;
     if (GetEnvironmentVariableW(L"MP_FRUITY_NOCOMPAT", nullptr, 0) == 0) {
         HookIlModules(module->dll);   // this plug-in's IAT, always
         InstallFruityHooks(module->dll, path);   // sweep + private fonts, once per process
@@ -1166,6 +1367,9 @@ bool FruityNode::Load(const std::wstring& path, std::wstring& error) {
         plug = nullptr;
         return false;
     }
+    FruityDbg("info: '%s' flags=%08x params=%d outctrls=%d\n",
+              info.longName ? info.longName : "?", info.flags, info.numParams, info.numOutCtrls);
+    isGenerator = (info.flags & FPF_Generator) != 0;
     numParams = std::clamp(info.numParams, 0, 4096);
     paramIsFloat.assign(numParams, 0);
     paramNames.assign(numParams, {});
@@ -1238,23 +1442,55 @@ void FruityNode::SyncTransport(const mp::Transport& t) {
 void FruityNode::Process(mp::ProcessContext& ctx) {
     const int n = std::min(ctx.frames, maxBlock);
     SyncTransport(ctx.transport);
-    float* src = inBuf.data();
     const int inch = ctx.inChannels[0];
-    for (int i = 0; i < n; ++i) {
-        src[i * 2] = inch > 0 ? ctx.in[0][0][i] : 0.f;
-        src[i * 2 + 1] = inch > 1 ? ctx.in[0][1][i] : src[i * 2];
+    int produced = n;
+    bool ok;
+    if (isGenerator) {
+        GuardedNoArgCall(plug, PV_NewTick);
+        GuardedNoArgCall(plug, PV_MIDITick);
+        ok = GuardedGenRender(plug, outBuf.data(), produced);
+    } else {
+        float* src = inBuf.data();
+        for (int i = 0; i < n; ++i) {
+            src[i * 2] = inch > 0 ? ctx.in[0][0][i] : 0.f;
+            src[i * 2 + 1] = inch > 1 ? ctx.in[0][1][i] : src[i * 2];
+        }
+        ok = GuardedRender(plug, src, outBuf.data(), n);
     }
-    if (!GuardedRender(plug, src, outBuf.data(), n)) {
+    if (!ok) {
         failed = true;
         for (int c = 0; c < ctx.outChannels[0]; ++c) {
-            const float* s = inch > 0 ? ctx.in[0][std::min(c, inch - 1)] : nullptr;
+            const float* s = !isGenerator && inch > 0 ? ctx.in[0][std::min(c, inch - 1)] : nullptr;
             if (s) std::copy(s, s + n, ctx.out[0][c]); else std::fill(ctx.out[0][c], ctx.out[0][c] + n, 0.f);
         }
         return;
     }
+    produced = std::clamp(produced, 0, n);
     const float* dst = outBuf.data();
-    for (int c = 0; c < ctx.outChannels[0]; ++c)
-        for (int i = 0; i < n; ++i) ctx.out[0][c][i] = dst[i * 2 + std::min(c, 1)];
+    for (int c = 0; c < ctx.outChannels[0]; ++c) {
+        for (int i = 0; i < produced; ++i) ctx.out[0][c][i] = dst[i * 2 + std::min(c, 1)];
+        if (produced < n) std::fill(ctx.out[0][c] + produced, ctx.out[0][c] + n, 0.f);
+    }
+}
+
+void FruityNode::SendMIDI(uint32_t msg) {
+    if (!plug || failed) return;
+    GuardedMIDIIn(plug, msg);
+}
+intptr_t FruityNode::NoteOn(int semitone, float velocity) {
+    if (!plug || failed) return 0;
+    VoiceParams vp{};
+    vp.init = {0.f, std::clamp(velocity, 0.f, 1.f), semitone * 100.f, 0.f, 0.f};
+    vp.fin = vp.init;
+    bool ok = true;
+    IntP h = GuardedTriggerVoice(plug, &vp, 0, ok);
+    if (!ok || !h) return 0;
+    FruityDbg("note: trigger %d vel=%.2f -> voice %lld\n", semitone, velocity, (long long)h);
+    return (intptr_t)h;
+}
+void FruityNode::NoteOff(intptr_t voice) {
+    if (!plug || failed || !voice) return;
+    GuardedVoiceCall(plug, PV_VoiceRelease, (IntP)voice);
 }
 
 int FruityNode::RawParam(int index) const {

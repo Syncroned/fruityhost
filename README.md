@@ -18,6 +18,13 @@ plug-in-manager factory that Patcher uses for nested plug-ins) to make most
 FL Studio 2025 effects construct, process, save state, and open their VCL
 editor forms inside a plain Win32 window.
 
+**Generators work too.** With a generator (`FPF_Generator`, e.g. FLEX) the
+host renders through `Gen_Render`, advances the voice engine with
+`NewTick`/`MIDITick`, feeds notes through `TriggerVoice` and packed `MIDIIn`,
+and answers the service-level path queries (`vt[0](code, flag, out0x400)`)
+that plug-ins use to find their content — FLEX's pack browser populates and
+its voices produce real audio.
+
 ## Build
 
 Windows x64, MSVC, CMake ≥ 3.28, static CRT:
@@ -64,6 +71,13 @@ host protocol — the primary reverse-engineering tool.
 - **`.fst` presets.** `fstfile.cpp` parses FL's `FLhd`/`FLdt` preset files;
   plug-ins that take files (Patcher) get them via `FPD_LoadFile`, others get
   the state chunk via `SaveRestoreState`.
+- **Content search paths.** Service objects' `vt[0]` doubles as a
+  record/path query: plug-ins call it with `(code, flag, out0x400)` where
+  flag indexes the search root (0 = `Documents\Image-Line`, 1 = factory
+  `Data\Patches\Packs`, 2 = `Data`) and out is a UTF-8 buffer — how FLEX
+  finds `FLEX\Packs\*.preset` and `*.flexpack`.
+- **Shared-library fallback.** Bare-name `LoadLibrary` misses (e.g.
+  `oggio_x64.dll`) are retried against `<FL root>\Shared`.
 
 ## Layout
 
