@@ -83,11 +83,11 @@ host protocol — the primary reverse-engineering tool.
 
 | file | role |
 | --- | --- |
-| `main.cpp` | file picker + host stub + message loop |
-| `fruitynode.*` | the Fruity host: Delphi impersonation, services, mirror, editor |
-| `presetui.*` | Presets menu + `.fst` drag & drop on editor windows |
-| `fstfile.*` | `.fst` preset parser |
-| `node.*`, `rt.h`, `mp_engine.h` | minimal node/host plumbing the host builds against |
+| `src/main.cpp` | file picker + host stub + message loop |
+| `src/fruity/fruitynode.*` | the Fruity host: Delphi impersonation, services, mirror, editor |
+| `src/fruity/presetui.*` | Presets menu + `.fst` drag & drop on editor windows |
+| `src/fruity/fstfile.*` | `.fst` preset parser |
+| `src/node/*` | minimal node/host plumbing the host builds against |
 
 Protocol notes inline in `fruitynode.cpp` were verified empirically against
 FL Studio 2025 and instrumented probes; expect gaps.
